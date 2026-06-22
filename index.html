@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Calm Focus Timer</title>
+<style>
+  :root{
+    --bg:#0b0d10; --text:#e9ecef; --muted:#7f8893; --line:#222a33; --panel:#12161b;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font:16px/1.4 ui-sans-serif,system-ui,-apple-system,sans-serif;
+    display:flex; flex-direction:column; min-height:100vh;
+    -webkit-font-smoothing:antialiased;
+  }
+  .topbar{display:flex; justify-content:center; padding:22px 16px 0}
+  .modes{display:inline-flex; border:1px solid var(--line); border-radius:999px; overflow:hidden}
+  .modes button{
+    background:transparent; color:var(--muted); border:0; padding:8px 18px;
+    font-size:13px; letter-spacing:.03em; cursor:pointer;
+  }
+  .modes button[aria-pressed="true"]{background:var(--panel); color:var(--text)}
+  main{flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:34px; padding:24px}
+  .count{
+    font-variant-numeric:tabular-nums; font-weight:300;
+    font-size:clamp(72px, 22vw, 200px); line-height:1; letter-spacing:.01em;
+    transition:opacity .6s ease;
+  }
+  .count.done{opacity:.45}
+  .state{min-height:18px; color:var(--muted); font-size:13px; letter-spacing:.04em; text-transform:lowercase}
+  .presets{display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:center}
+  .presets button, .controls button{
+    background:transparent; color:var(--text); border:1px solid var(--line);
+    border-radius:8px; padding:10px 16px; font-size:14px; cursor:pointer;
+  }
+  .presets button[aria-pressed="true"]{border-color:var(--muted); background:var(--panel)}
+  .presets input{
+    width:78px; background:transparent; color:var(--text); border:1px solid var(--line);
+    border-radius:8px; padding:10px 12px; font-size:14px; text-align:center;
+  }
+  .controls{display:flex; gap:10px}
+  .controls .primary{min-width:120px; border-color:var(--muted)}
+  button:hover{border-color:var(--muted)}
+  button:focus-visible, input:focus-visible{outline:2px solid var(--muted); outline-offset:2px}
+  footer{padding:0 16px 28px; text-align:center; color:var(--muted); font-size:13px}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="modes" role="group" aria-label="Timer mode">
+      <button id="mode-focus" aria-pressed="true">Focus</button>
+      <button id="mode-break" aria-pressed="false">Break</button>
+    </div>
+  </div>
+
+  <main>
+    <div class="count" id="count" role="timer" aria-live="off">25:00</div>
+    <div class="state" id="state" aria-live="polite"></div>
+
+    <div class="presets" id="presets" aria-label="Duration"></div>
+
+    <div class="controls">
+      <button class="primary" id="startPause">Start</button>
+      <button id="reset">Reset</button>
+    </div>
+  </main>
+
+  <footer><span id="today">Focus sessions today: 0</span></footer>
+
+<script>
+  "use strict";
+  const PRESETS = { focus: [25, 50], break: [5, 10] };
+  const $ = (id) => document.getElementById(id);
+
+  let mode = "focus";
+  let durationSec = 25 * 60;
+  let remainingSec = durationSec;
+  let endAt = null;        // timestamp the current run ends at
+  let ticker = null;
+  let completed = false;
+
+  // --- today's focus-session count (local only) ---
+  const todayKey = () => "cft:focus:" + new Date().toISOString().slice(0, 10);
+  const getCount = () => Number(localStorage.getItem(todayKey()) || 0);
+  const bumpCount = () => localStorage.setItem(todayKey(), String(getCount() + 1));
+  const renderCount = () => { $("today").textContent = "Focus sessions today: " + getCount(); };
+
+  function fmt(sec){
+    sec = Math.max(0, Math.round(sec));
+    const m = Math.floor(sec / 60), s = sec % 60;
+    return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+  }
+
+  function renderTime(){ $("count").textContent = fmt(remainingSec); }
+
+  function setState(text){ $("state").textContent = text; }
+
+  function isRunning(){ return ticker !== null; }
+
+  function renderControls(){
+    $("startPause").textContent = isRunning() ? "Pause" : (completed ? "Start" : (remainingSec < durationSec ? "Resume" : "Start"));
+    $("count").classList.toggle("done", completed);
+  }
+
+  function buildPresets(){
+    const wrap = $("presets");
+    wrap.innerHTML = "";
+    PRESETS[mode].forEach((min) => {
+      const b = document.createElement("button");
+      b.textContent = min + " min";
+      b.setAttribute("aria-pressed", String(durationSec === min * 60));
+      b.onclick = () => chooseDuration(min * 60);
+      wrap.appendChild(b);
+    });
+    const input = document.createElement("input");
+    input.type = "number"; input.min = "1"; input.max = "180";
+    input.placeholder = "custom";
+    input.setAttribute("aria-label", "Custom minutes");
+    input.oninput = () => {
+      const v = Math.max(1, Math.min(180, Math.floor(Number(input.value) || 0)));
+      if (v) chooseDuration(v * 60, /*fromInput*/ true);
+    };
+    wrap.appendChild(input);
+  }
+
+  function chooseDuration(sec, fromInput){
+    stop();
+    durationSec = sec;
+    remainingSec = sec;
+    completed = false;
+    setState("");
+    renderTime(); renderControls();
+    if (!fromInput) buildPresets(); // refresh aria-pressed
+  }
+
+  function tick(){
+    remainingSec = (endAt - Date.now()) / 1000;
+    if (remainingSec <= 0){
+      remainingSec = 0;
+      stop();
+      complete();
+    }
+    renderTime();
+  }
+
+  function start(){
+    if (remainingSec <= 0) return;
+    completed = false;
+    endAt = Date.now() + remainingSec * 1000;
+    ticker = setInterval(tick, 250);
+    setState(mode === "focus" ? "focusing" : "on a break");
+    renderControls();
+  }
+
+  function pause(){
+    if (!isRunning()) return;
+    remainingSec = (endAt - Date.now()) / 1000;
+    stop();
+    setState("paused");
+    renderTime(); renderControls();
+  }
+
+  function stop(){
+    if (ticker){ clearInterval(ticker); ticker = null; }
+    endAt = null;
+  }
+
+  function reset(){
+    stop();
+    remainingSec = durationSec;
+    completed = false;
+    setState("");
+    renderTime(); renderControls();
+  }
+
+  function complete(){
+    completed = true;
+    chime();
+    if (mode === "focus"){ bumpCount(); renderCount(); }
+    setState(mode === "focus" ? "session complete" : "break complete");
+    renderControls();
+  }
+
+  // Gentle two-note chime via WebAudio (no external files, no network).
+  function chime(){
+    try{
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new Ctx();
+      [528, 396].forEach((freq, i) => {
+        const osc = ctx.createOscillator(), gain = ctx.createGain();
+        osc.type = "sine"; osc.frequency.value = freq;
+        const t = ctx.currentTime + i * 0.5;
+        gain.gain.setValueAtTime(0, t);
+        gain.gain.linearRampToValueAtTime(0.12, t + 0.08);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t + 1.6);
+        osc.connect(gain); gain.connect(ctx.destination);
+        osc.start(t); osc.stop(t + 1.7);
+      });
+    }catch(e){ /* audio optional; timer still completes */ }
+  }
+
+  function switchMode(next){
+    if (next === mode) return;
+    mode = next;
+    $("mode-focus").setAttribute("aria-pressed", String(mode === "focus"));
+    $("mode-break").setAttribute("aria-pressed", String(mode === "break"));
+    chooseDuration(PRESETS[mode][0] * 60);
+  }
+
+  // --- wiring ---
+  $("mode-focus").onclick = () => switchMode("focus");
+  $("mode-break").onclick = () => switchMode("break");
+  $("startPause").onclick = () => (isRunning() ? pause() : start());
+  $("reset").onclick = reset;
+  document.addEventListener("keydown", (e) => {
+    if (e.code === "Space" && e.target.tagName !== "INPUT"){ e.preventDefault(); isRunning() ? pause() : start(); }
+  });
+
+  buildPresets();
+  renderTime();
+  renderControls();
+  renderCount();
+</script>
+</body>
+</html>
